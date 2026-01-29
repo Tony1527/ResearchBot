@@ -1,53 +1,19 @@
-import json
-from paperqa import Docs, Settings, Doc
-from paperqa.settings import ParsingSettings
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from langchain_chroma import Chroma
-from pathlib import Path
-import asyncio
-from langchain_huggingface import HuggingFaceEmbeddings
-from sentence_transformers import CrossEncoder
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from torch import chunk
-import shutil
-import numpy as np
-from langchain_litellm import ChatLiteLLM
-import re
-import hashlib
-from huggingface_hub import snapshot_download
+from litellm import embedding
+from prompt import *
+from utility import *
+from tools import *
+
+## remove the warning from pydantic when using the LiteLLM 
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Pydantic serializer warnings",
+    module="pydantic.main"
+)
 
 ID = str
 
-def md5str(data: str | bytes) -> str:
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return hashlib.md5(data).hexdigest() 
 
-
-doc_paths = ("./PaperQA2.pdf", "./PbSnSe.pdf", "./PbSnSe-copy.pdf")
-
-CANNOT_ANSWER_PHRASE = "I cannot answer"
-
-answer_prompt = (
-    "Answer the question below with the context.\n\n"
-    "Context:\n\n{context}\n\n---\n\n"
-    "Question: {question}\n\n"
-    "Write an answer based on the context. "
-    "If the context provides insufficient information reply "
-    f'"{CANNOT_ANSWER_PHRASE}." '
-    "For each part of your answer, indicate which sources most support "
-    "it via citation keys at the end of sentences, like \n\n"
-    "{example_citation}\n\n. "
-    "Only cite from the context above and only use the citation keys from the context.\n\n"
-    # f"\n\n{CITATION_KEY_CONSTRAINTS}\n\n"
-    "Do not concatenate citation keys, just use them as is. "
-    "Write in the style of a scientific article, with concise sentences and "
-    "coherent paragraphs. This answer will be used directly, "
-    "so do not add any extraneous information.\n\n"
-    "{prior_answer_prompt}"
-)
 
 
 superscript2num = {
@@ -56,20 +22,9 @@ superscript2num = {
 }
 num2superscript = dict(zip(superscript2num.values(), superscript2num.keys()))
 
-def get_content_from_response(res) -> str:
-    if isinstance(res, dict) and res.get("messages"):
-        return res["messages"][-1].content.strip()
-    elif isinstance(res, list):
-        return res[-1]
-    else:  
-        return res.content.strip()
-
-
-
-    print("\n----------------\n")
-
 class AnswerFormat(BaseModel):
-    """Schema for answer prompt."""
+    '''Schema for answer prompt.
+    '''
     prior_answer_prompt: str | None = Field(
         default="",
         description="Prompt to include prior answer information."
@@ -92,9 +47,56 @@ class AnswerFormat(BaseModel):
     )
 
 
+class ArxivSearch(BaseModel):
+  ''' Schema for searching arxiv papers.
+  '''
+  keywords: Optional[List[str]] | None = Field(None, description="the main search keywords.")
+  must_have_all_keywords: bool = Field(True, description="Whether all keywords must be present in the search results.")
+  categories: Optional[List[str]] | None = Field(None, description="List of arxiv categories to search in")
+  must_have_all_categories: bool = Field(True, description="Whether all categories must be present in the search results.")
+  authors: Optional[List[str]] | None = Field(None, description="List of authors to search for")
+  must_have_all_authors: bool = Field(True, description="Whether all authors must be present in the search results.")
+  date_from: Optional[date] | None = Field(None, description="Start date in 'YYYY-MM-DD' format. Example: '2023-01-01'.")
+  date_to: Optional[date] | None = Field(None, description="End date in 'YYYY-MM-DD' format. Defaults to today.")
+  max_results: Optional[int] | None = Field(100, description="Maximum number of results to return")
+  sort_by: Optional[Literal["relevance", "lastUpdatedDate", "submittedDate"]] | None = Field("submittedDate", description="Criterion to sort results by")
 
+class ArxivResult(BaseModel):
+    ''' Schema for a single arxiv paper result.
+    '''
+    title: str = Field("", description="Title of the paper.")
+    authors: List[str] = Field(default_factory=list, description="List of authors of the paper.")
+    full_summary: str = Field("", description="Full summary of the paper.")
+    pdf_url: str = Field("", description="URL to download the PDF of the paper.")
 
+    updated: str = Field("", description="The date when the paper was last updated.")
+    published: str = Field("", description="The date when the paper was published.")
+    doi: Optional[str] = Field(None, description="DOI of the paper, if available.")
 
+    refined_summary: str = Field("", description="A concise summary of the paper's key contributions and findings.")
+    score: int = Field(0, description="Relevance score of the paper from 0 to 100 based on the search criteria.", ge=0, le=100)
+
+class ArxivResults(BaseModel):
+    ''' Schema to combine all arxiv search results.
+    '''
+    query: str = Field("", description="Query used for the search.")
+    total_results: int = Field(0, description="Total number of results found.")
+    papers: List[ArxivResult] = Field(default_factory=list, description="List of papers found.")
+
+def convert_date_to_arxiv_format(d: date) -> str:
+    ''' Convert a date object to the arxiv date format 'YYYYMMDDHHmm'. '''
+    return "".join(d.isoformat().split("-"))+"0600"
+
+async def summarize_abstract(chain, title, full_summary) -> str:
+    ''' Summarize the abstract using the provided chain.'''
+    if not full_summary:
+        return ""
+    try:
+        res = await chain.ainvoke({"title": title, "full_summary": full_summary})
+        return get_content_from_response(res)
+    except Exception as e:
+        print(f"Error in summarize_abstract: {e}")
+        return ""
 
 
 
@@ -150,18 +152,18 @@ class Collection():
         
 
         self.separators=[
-            # 优先级最高：段落（最希望保留完整段落）
+            # Priority highest: paragraphs (prefer to keep complete paragraphs)
             "\n\n\n",
             "\n\n",
-            # 英文/混合场景常用标点
+            # Common punctuation used in English/mixed contexts
             ". ", "! ", "? ", ".\n", "!\n", "?\n",
-            # 中文常见句子结束标点（最重要！）
+            # Common Chinese sentence-ending punctuation (most important)
             "。", "！", "？", "…", 
-            # 再其次：其他中文标点、半角逗号等
+            # Next: other Chinese punctuation and half-width commas
             "；", "; ", "，", ", ",
-            # 再往后：空格、换行（避免太碎）
+            # Then: spaces and newlines (avoid creating very small chunks)
             " ", "\n", 
-            # 最后手段：单个字符（几乎不会用到）
+            # Last resort: single character (rarely used)
             ""
         ]
 
@@ -250,12 +252,11 @@ class Collection():
     async def aadd_dir(self, dir_path: str|Path):
         ''' recursively add all documents in a directory '''
         if isinstance(dir_path, str):
-            cur_dir = Path(dir_path)
+            target_dir = Path(dir_path)
         else:
-            cur_dir = dir_path
+            target_dir = dir_path
 
-        all_files = [p for p in cur_dir.rglob('*') if p.is_file() and self.is_solvable_file(p)]
-
+        all_files = [p for p in target_dir.rglob('*') if p.is_file() and self.is_solvable_file(p)]
         print(f"Found {len(all_files)} files:")
         for file in all_files:
             print(f" - {str(file)}")
@@ -283,7 +284,7 @@ class Collection():
         self.update_dockey_file()
         
 
-        # # 定义一个回调函数，处理流式输出
+        # Define a callback function to handle streaming output
         # def on_token_callback(token: str):
         #     print(token, end="", flush=True)
 
@@ -299,7 +300,7 @@ class Collection():
 
         scored_docs = []
         for doc, score in zip(docs, scores):
-            doc.metadata["relevance_score"] = float(score) # 存下分数
+            doc.metadata["relevance_score"] = float(score) # save the score
             if score > self.score_threshold:
                 scored_docs.append(doc)
 
@@ -353,13 +354,14 @@ class Collection():
 
         cite_ids = sorted(list(set(cite_ids)))
 
-        print(cite_ids)
+        # print(cite_ids)
 
 
         citation_str = "\n".join([citations[cite_ids[i]] for i in range(len(cite_ids))])+"\n\n"
 
-        print(main_content)
-        print(citation_str)
+        # print(main_content)
+        # print(citation_str)
+
 
         return main_content + citation_str
 
@@ -369,17 +371,297 @@ class Collection():
 
 
 
+    
+
+class ResearchBotConfig(BaseModel):
+    ''' Configuration schema for ResearchBot
+    '''
+    is_local_llm: bool = Field(False, description="Whether to use local LLM model.")
+    is_local_embedding: bool = Field(True, description="Whether to use local embedding model.")
+    is_local_reranker: bool = Field(True, description="Whether to use local reranker model.")
+    llm_model: str = Field("deepseek/deepseek-chat", description="LLM model path or API.")
+    embedding_model: str = Field("BAAI/bge-m3", description="Embedding model path or API.")
+    reranker_model: str = Field("cross-encoder/ms-marco-MiniLM-L-6-v2", description="Reranker model path or API.")
+
+
+    max_sources: int = Field(10, description="Maximum number of sources to retrieve.")
+    chunk_chars: int = Field(500, description="Number of characters per document chunk.")
+    overlap: int = Field(100, description="Number of overlapping characters between chunks.")
+    persist_directory: str = Field("./output/collection", description="Directory to persist the collection data.")
+    local_files_dir: str = Field(".", description="Directory path for local files to search.")
+    is_streaming: bool = Field(True, description="Whether to enable streaming responses.")
+    
+
+
+
+class ResearchBot():
+    ''' The main ResearchBot class
+    '''
+    def __init__(self, config: ResearchBotConfig):
+        @tool
+        async def local_files_search(query) -> str:
+            '''
+                Searches information in the local files or personal folders based on the user's query.
+            '''
+            print(query)
+            res = await self.collection.ainvoke(query)
+
+            print("---------------- End of local_files_search ----------------")
+            return res
+        
+        @tool(args_schema=ArxivSearch)
+        async def arxiv_search(keywords: Optional[List[str]] = None,
+                        must_have_all_keywords: bool = True,
+                        categories: Optional[List[str]] = None,
+                        must_have_all_categories: bool = True,
+                        authors: Optional[List[str]] = None,
+                        must_have_all_authors: bool = True,
+                        date_from: Optional[date] = None,
+                        date_to: Optional[date] = None,
+                        max_results: Optional[int] = 10,
+                        sort_by: Optional[Literal["relevance", "lastUpdatedDate", "submittedDate"]] = "submittedDate"
+                        ) -> str:
+            '''
+                Searches the arxiv for relevant papers based on the user's query.
+            '''
+            return await self._arxiv_search(
+                keywords, must_have_all_keywords, categories, must_have_all_categories,
+                authors, must_have_all_authors, date_from, date_to, max_results, sort_by
+            )
+
+        self.config = config
+        is_streaming = config.is_streaming
+        is_local_embedding = config.is_local_embedding
+        is_local_reranker = config.is_local_reranker
+
+        if is_local_embedding:
+            # Download into the project's models folder to avoid external network dependency
+            local_model_path = f"./models/{config.embedding_model}" 
+
+            if not Path(local_model_path).exists():
+                snapshot_download(
+                    repo_id=config.embedding_model,
+                    local_dir=local_model_path,
+                    local_dir_use_symlinks=False
+                )
+            embedding = local_model_path
+
+        if is_local_reranker:
+            local_cross_encoder_path = f"./models/{config.reranker_model}"
+            if not Path(local_cross_encoder_path).exists():
+                snapshot_download(
+                    repo_id=config.reranker_model,
+                    local_dir=local_cross_encoder_path,
+                    local_dir_use_symlinks=False
+                )
+            reranker = local_cross_encoder_path
+        
+
+        # Initialize with your desired model and enable streaming
+        self.main_llm = ChatLiteLLM(
+            model=config.llm_model, # Or any LiteLLM-supported model
+            streaming=is_streaming,
+            temperature=0
+        )
+
+        self.academic_llm= ChatLiteLLM(
+            model=config.llm_model, # Or any LiteLLM-supported model
+            streaming=False,
+            temperature=0
+        )
+
+        self.collection = Collection(llm=self.main_llm, embedding=embedding, reranker=reranker, chunk_chars=self.config.chunk_chars, overlap=self.config.overlap, max_sources=self.config.max_sources, persist_directory=self.config.persist_directory)
+
+        self.agent = create_agent(
+            self.main_llm,
+            tools = [parse_fuzzy_date, arxiv_search, local_files_search]
+        )
+
+    async def aadd_dir(self, local_files_dir: str):
+        ''' Create a new collection '''
+        await self.collection.aadd_dir(local_files_dir)
+
+    async def stream_response(self, input: str, **kwargs):
+        ''' Stream response from the ResearchBot agent '''
+        await stream_response(self.agent, input, streaming=self.config.is_streaming, **kwargs)
+
+    async def ainvoke(self, input: str, **kwargs):
+        ''' Asynchronously query the ResearchBot agent to get an answer '''
+        return await self.agent.ainvoke(input=input, **kwargs)
+    
+    def invoke(self, input: str, **kwargs):
+        ''' Synchronously query the ResearchBot agent to get an answer '''
+        return self.agent.invoke(input=input, **kwargs)
+
+    async def _arxiv_search(
+                    self,
+                    keywords: Optional[List[str]] = None,
+                    must_have_all_keywords: bool = True,
+                    categories: Optional[List[str]] = None,
+                    must_have_all_categories: bool = True,
+                    authors: Optional[List[str]] = None,
+                    must_have_all_authors: bool = True,
+                    date_from: Optional[date] = None,
+                    date_to: Optional[date] = None,
+                    max_results: Optional[int] = 10,
+                    sort_by: Optional[Literal["relevance", "lastUpdatedDate", "submittedDate"]] = "submittedDate"
+                    ) -> str:
+        '''
+            Searches the arxiv for relevant papers based on the user's query.
+        '''
+        
+
+        print("------------- arxiv_search ---------------")
+
+        ## organize query parts
+
+        query_parts = []
+
+
+        if authors:
+
+            authors_query_parts = []
+            authors = [author.strip() for author in authors]
+            diff_format_authors = [
+                authors,
+                # [author.replace(",", " ").strip() if "," in author else ", ".join(author.split()).strip()
+                # for author in authors],
+                [author.replace(" ", ", ").strip() for author in authors]
+            ]
+            for diff_format in diff_format_authors:
+                if must_have_all_authors:
+                    authors_query_parts.append(" AND ".join([f"au:\"{author}\"" for author in diff_format]))
+                else:
+                    authors_query_parts.append(" OR ".join([f"au:\"{author}\"" for author in diff_format]))
+            query_parts.append(" OR ".join(["("+lim+")" for lim in authors_query_parts]))
+
+            
+            # query_parts.append(" OR ".join([f"au:\"{author}\"" for author in authors]))
+
+            # if must_have_all_authors:
+            #     query_parts.append(" AND ".join([f"au:\"{author}\"" for author in authors]))
+            # else:
+            #     query_parts.append(" OR ".join([f"au:\"{author}\"" for author in authors]))
+
+            # query_parts.append(" OR ".join([f"au:\"{author}\"" for author in authors]))
+            # query_parts.append(" OR ".join([f"(au:\"{author}\")" for author in authors]))
+        if keywords:
+            if must_have_all_keywords:
+                query_parts.append(" AND ".join([f"all:\"{kw}\"" for kw in keywords]))
+            else:
+                query_parts.append(" OR ".join([f"all:\"{kw}\"" for kw in keywords]))
+        
+        
+        
+        
+        
+        if categories:
+            if must_have_all_categories:
+                query_parts.append(" AND ".join([f"cat:\"{cat}\"" for cat in categories]))
+            else:
+                query_parts.append(" OR ".join([f"cat:\"{cat}\"" for cat in categories]))
+        
+        if not date_from:
+            date_from = date.fromordinal(date.today().toordinal()-14)
+        
+        if not date_to:
+            date_to = date.fromordinal(date.today().toordinal())
+        
+
+        query_parts.append(f"submittedDate:[{convert_date_to_arxiv_format(date_from)} TO {convert_date_to_arxiv_format(date_to)}]")
+
+
+        sort_map = {
+            "relevance": arxiv.SortCriterion.Relevance,
+            "lastUpdatedDate": arxiv.SortCriterion.LastUpdatedDate,
+            "submittedDate": arxiv.SortCriterion.SubmittedDate
+        }
+
+        query = query_parts[0] + " AND "
+        query += " AND ".join(["("+query_parts[i]+")" for i in range(1,len(query_parts))])
+        # query = " AND ".join(["("+lim+")" for lim in query_parts])
+        print(query)
+
+        ## start arxiv searching
+
+        search = arxiv.Search(
+            query = query,
+            max_results = max_results,
+            sort_by = sort_map[sort_by]
+        )
+
+        tmp_results = []
+        
+        client = arxiv.Client()
+
+        print(urlencode(search._url_args()))
+
+        for i, r in enumerate(client.results(search)):
+            tmp_results.append(ArxivResult(
+                title=r.title,
+                authors=[str(author) for author in r.authors],
+                full_summary=r.summary,
+                pdf_url=r.pdf_url,
+                updated=r.updated.isoformat(),
+                published=r.published.isoformat(),
+                doi=r.doi,
+                refined_summary="",
+                score=0))
+            
+        arxiv_results = ArxivResults(
+            query=query,
+            total_results=len(tmp_results),
+            papers=tmp_results
+        )
+
+        formatted_output = [f"Found {len(arxiv_results.papers)} papers for query: '{query}'\n"]
+        
+        arxiv_papers = list(arxiv_results.papers)
+        
+        ## check if no papers found
+        if not arxiv_papers:
+            return f"No papers found for query: {query}\n\n"
+        
+        ## create refine chain
+        refine_chain = ChatPromptTemplate.from_template(abstract_refine_system_prompt) | self.academic_llm
+
+        ## asynchronously refine abstracts
+        tasks = [summarize_abstract(refine_chain, paper.title, paper.full_summary) for paper in arxiv_papers]
+        refine_abstracts = await asyncio.gather(*tasks)
+        print(f"After refining {len(arxiv_papers)} papers concurrently...")
+
+
+        ## Process papers (invoking LLM for summary extraction)
+        for i, (paper, refined_summary) in enumerate(zip(arxiv_papers, refine_abstracts)):
+            entry = (
+                f"### {i+1}. {paper.title}\n"
+                f"{', '.join(paper.authors)}\n"
+                f"- **Refined Summary (AI)**: {refined_summary}\n"
+                f"- **Link**: {paper.pdf_url}\n"
+                f"- **Published**: {paper.published}  **Updated**: {paper.updated}\n"
+            )
+            print(entry)
+            formatted_output.append(entry)
+
+        print("------------- arxiv_search ---------------")
+
+        return ("\n".join(formatted_output))+"\n\n"
+
+
+    
+
+
 async def main():
     ''' for testing the Collection class '''
     tools = []
-    streaming = True
+    is_streaming = True
     is_local_embedding = True
     is_local_reranker = True
 
     # Initialize with your desired model and enable streaming
     main_llm = ChatLiteLLM(
         model="deepseek/deepseek-chat", # Or any LiteLLM-supported model
-        streaming=streaming,
+        streaming=is_streaming,
         temperature=0
     )
 
@@ -400,7 +682,7 @@ async def main():
 
 
     if is_local_embedding:
-        # 下载到项目目录下的 models 文件夹，从此不再依赖网络
+        # Download into the project's models folder to avoid external network dependency
         local_model_path = "./models/BAAI/bge-m3" 
         # local_model_path = "./models/BAAI/bge-large-en" 
 
@@ -421,8 +703,8 @@ async def main():
                 local_dir_use_symlinks=False
             )
         reranker = local_cross_encoder_path
-    col = Collection(llm=main_llm, embedding=embedding, reranker=reranker, chunk_chars=500, overlap=100, max_sources=10)
-    await col.aadd_dir("./my_papers")
+    collection = Collection(llm=main_llm, embedding=embedding, reranker=reranker, chunk_chars=500, overlap=100, max_sources=10)
+    await collection.aadd_dir("./my_papers")
 
 
 if __name__ == "__main__":

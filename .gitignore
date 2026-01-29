@@ -153,3 +153,8 @@ Desktop.ini
 *.p12
 secrets/
 credentials/
+
+models/
+output/
+*.ipynb
+my_papers/
