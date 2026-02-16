@@ -5,11 +5,15 @@ import operator
 import os
 import re
 import shutil
+import token
 import warnings
+import sys
 from datetime import date
 from pathlib import Path
-from typing import Annotated, List, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Tuple, Optional
 from urllib.parse import urlencode
+from importlib_metadata import metadata
+from tqdm.asyncio import tqdm_asyncio
 
 import arxiv
 import numpy as np
@@ -19,10 +23,11 @@ from IPython.display import Image, display
 # LangChain & LangGraph
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, PyMuPDFLoader
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_litellm import ChatLiteLLM
@@ -31,6 +36,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import Command
+from langchain_core.output_parsers.json import SimpleJsonOutputParser
 
 # Other ML/Data Libraries
 from paperqa import Doc, Docs, Settings
@@ -42,11 +48,14 @@ from torch import chunk
 
 def get_content_from_response(res) -> str:
     if isinstance(res, dict) and res.get("messages"):
-        return res["messages"][-1].content.strip()
+        return res["messages"][-1].content
+    elif isinstance(res, str):  
+        return res
     elif isinstance(res, list):
         return res[-1]
-    else:  
-        return res.content.strip()
+    else:
+        return res.content
+    
 
 
 def md5str(data: str | bytes) -> str:
@@ -59,20 +68,67 @@ async def stream_response(agent, inputs, streaming, **kwargs):
     ''' Stream response from agent.
         Note: be careful that you should use await when is_stream is True
     '''
-    if not (isinstance(inputs, dict) and inputs.get("messages")):
-        input_msg = {"messages": inputs}
+    if agent is None and isinstance(inputs, str):
+        print(inputs)
+        return inputs
+    elif isinstance(agent, BaseChatModel):
+        input_msg =  [HumanMessage(content=inputs)]
+    else:
+        if not (isinstance(inputs, dict) and inputs.get("messages")):
+            input_msg = {"messages": [HumanMessage(content=inputs)]}
+        else:
+            input_msg = inputs
 
+    res = ""
     if not streaming:
         response = await agent.ainvoke(input=input_msg, **kwargs)
-        print(get_content_from_response(response))
+        res += get_content_from_response(response)
+        print(res)
 
 
         # for token, metadata  in agent.stream(input=input_msg,stream_mode="messages", **kwargs):
         #     if token.content:
         #         print(token.content, end="", flush=True)
     else:
-        async for token, metadata  in agent.astream(input=input_msg,stream_mode="messages", **kwargs):
+        async for tmp in agent.astream(input=input_msg,stream_mode="messages", **kwargs):
+            if isinstance(tmp, tuple) and len(tmp) == 2:
+                token, metadata = tmp
+            else:
+                token = tmp
             if token.content:
                 print(token.content, end="", flush=True)
+                res += token.content
 
     print("\n----------------\n")
+    return res
+
+
+
+def create_schema_output(llm, base_model_name: BaseModel, input: str) -> Dict:
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """Output ONLY valid JSON. No explanation, no markdown, no fences, no extra text.
+            Task: Extract key information from the following and structure it in JSON.
+            Required JSON schema:
+            {schema}
+            """),
+        ("human", "{input}")
+    ])
+
+    # schema_str = json.dumps(CustomData.model_json_schema(), indent=2)
+    # prompt = prompt.partial(schema=schema_str)
+    
+    prompt = prompt.partial(schema = base_model_name.model_json_schema())
+    # print(prompt)
+
+    # LCEL 链
+    chain = prompt | llm | SimpleJsonOutputParser()
+    res = chain.invoke({"input": input})
+    return res
+
+
+def create_schema_by_tool_binding(llm, base_model_name: BaseModel, input: str) -> BaseModel:
+    chain = llm.bind_tools([base_model_name])
+    res = chain.invoke(input)
+    print(input)
+    print(res)
+    return base_model_name.model_validate(res.tool_calls[-1]["args"])

@@ -9,6 +9,8 @@ Scientific literature agent with local PDF retrieval and arXiv auto-summarizatio
     from dotenv import load_dotenv
     load_dotenv("./local_env.env")
     bot = ResearchBot(ResearchBotConfig())
+
+    ## creata local vector database
     await bot.aadd_dir("./path/to/local/dir")
 
     ## print result in a streaming mode

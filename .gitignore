@@ -158,3 +158,4 @@ models/
 output/
 *.ipynb
 my_papers/
+test.py
