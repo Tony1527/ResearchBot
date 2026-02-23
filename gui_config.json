@@ -1,0 +1,6 @@
+{
+  "llm_model": "deepseek/deepseek-chat",
+  "llm_api_key": "sk-f5816855fa8b453bbdb67dca9f59f0b1",
+  "email_api_key": "am_24a33fd9339cf9a0e4e6f747dfcd61258fe4a35e866de12ed3c0d7cde1cb4e0e",
+  "email_addr": "yemanxiaozu@agentmail.to"
+}

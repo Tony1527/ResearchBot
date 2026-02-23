@@ -10,7 +10,7 @@ import warnings
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Dict, List, Literal, Tuple, Optional
+from typing import Annotated, Any, Dict, List, Literal, Tuple, Type, TypeVar, Union, Optional
 from urllib.parse import urlencode
 from importlib_metadata import metadata
 from tqdm.asyncio import tqdm_asyncio
@@ -46,6 +46,36 @@ from sentence_transformers import CrossEncoder
 from torch import chunk
 
 
+import random
+
+async def simulate_streaming(text: str, callback=None, chunk_size=3, min_delay=0.001, max_delay=0.003):
+    """
+    Simulate streaming by yielding chunks of text with random small delays.
+    
+    Args:
+        text: The complete string to stream.
+        callback: Function to call with each chunk (e.g., UI update).
+        chunk_size: Number of characters to send at once.
+        min_delay: Minimum sleep time between chunks.
+        max_delay: Maximum sleep time between chunks.
+    """
+    if (not callback) and (not text):
+        raise ValueError("Either callback or text must be provided.")
+
+    # 将文本切片
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i : i + chunk_size]
+        
+        if callback:
+            callback(chunk)
+        
+        # 也可以顺便打印到终端
+        print(chunk, end="", flush=True)
+        
+        # 随机等待一小会儿，模拟打字感
+        await asyncio.sleep(random.uniform(min_delay, max_delay))
+
+
 def get_content_from_response(res) -> str:
     if isinstance(res, dict) and res.get("messages"):
         return res["messages"][-1].content
@@ -64,11 +94,13 @@ def md5str(data: str | bytes) -> str:
     return hashlib.md5(data).hexdigest() 
 
 
-async def stream_response(agent, inputs, streaming, **kwargs):
+async def stream_response(agent, inputs, streaming, callback=None, **kwargs):
     ''' Stream response from agent.
         Note: be careful that you should use await when is_stream is True
     '''
     if agent is None and isinstance(inputs, str):
+        if callback is not None:
+            callback(inputs)
         print(inputs)
         return inputs
     elif isinstance(agent, BaseChatModel):
@@ -83,6 +115,8 @@ async def stream_response(agent, inputs, streaming, **kwargs):
     if not streaming:
         response = await agent.ainvoke(input=input_msg, **kwargs)
         res += get_content_from_response(response)
+        if callback:
+            callback(res)
         print(res)
 
 
@@ -96,6 +130,8 @@ async def stream_response(agent, inputs, streaming, **kwargs):
             else:
                 token = tmp
             if token.content:
+                if callback is not None:
+                    callback(token.content)
                 print(token.content, end="", flush=True)
                 res += token.content
 

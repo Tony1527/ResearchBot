@@ -1,3 +1,4 @@
+from typing import Callable
 from litellm import embedding
 from sentence_transformers import SentenceTransformer
 from DeepLearning.ResearchBot import tools
@@ -66,7 +67,7 @@ class ArxivSearch(BaseModel):
   '''
   keywords: Optional[List[str]] | None = Field(None, description="Scientific terms, model names, topics to search.")
   must_have_all_keywords: bool = Field(True, description="Whether all keywords must be present in the search results.")
-  categories: Optional[List[str]] | None = Field(None, description="arXiv categories like 'cond-mat', 'quant-ph' etc.")
+  categories: Optional[List[str]] | None = Field(None, description="arXiv categories like 'cond-mat', 'quant-ph' etc. By default, it should search 'cond-mat' and 'quant-ph'.")
   must_have_all_categories: bool = Field(True, description="Whether all categories must be present in the search results.")
   authors: Optional[List[str]] | None = Field(None, description="List of authors to search for. Author names in 'Firstname Lastname' format.")
   must_have_all_authors: bool = Field(True, description="Whether all authors must be present in the search results.")
@@ -74,7 +75,7 @@ class ArxivSearch(BaseModel):
   date_to: Optional[date] | None = Field(None, description="End date in 'YYYY-MM-DD' format. Defaults to today.")
   max_results: Optional[int] | None = Field(50, description="Maximum number of results to return")
   sort_by: Optional[Literal["relevance", "lastUpdatedDate", "submittedDate"]] | None = Field("submittedDate", description="Criterion to sort results by")
-  markdown_format: bool = Field(False, description="Whether to format the results in markdown.")
+  markdown_format: bool = Field(False, description="Whether to format the results in markdown. By default, it should be False.")
 
 class ArxivResult(BaseModel):
     ''' Schema for a single arxiv paper result.
@@ -192,7 +193,7 @@ class Collection():
     ''' A wrapper class for a Docs object
     '''
 
-    def __init__(self, llm, embedding, reranker, max_sources: int=10, chunk_chars: int=500, overlap: int=50, persist_directory: str="./output/collection", streaming=True, **kwargs):
+    def __init__(self, llm, embedding, reranker, max_sources: int=10, chunk_chars: int=500, overlap: int=50, persist_directory: str="./output/collection", streaming=True,**kwargs):
         print("Initializing Collection...")
 
         self.llm = llm
@@ -203,8 +204,7 @@ class Collection():
 
 
         self.embedding, self.reranker = get_embedding_and_cross_encoder(embedding, reranker, get_device())
-
-        
+        self.callback = None
 
         self.output_path = Path(persist_directory)
 
@@ -253,6 +253,10 @@ class Collection():
         # self.retriever = self.vb.as_retriever(search_type="mmr",search_kwargs={"k": max_sources,"fetch_k": max_sources*2,"lambda_multimodal":0.2})
 
         print("Finish Initializing Collection...")
+
+    def set_callback(self, callback):
+        ''' Set the callback function for streaming responses '''
+        self.callback = callback
 
     async def _process_single_doc(self, doc_path: str|Path, semaphore: asyncio.Semaphore) -> ID:
         ''' Process a single document and add it to the vector store '''
@@ -339,8 +343,6 @@ class Collection():
 
         return doc.suffix.lower() == ".pdf"
 
-
-
     async def aadd_dir(self, dir_path: str|Path):
         ''' recursively add all documents in a directory '''
         ## @deprecated
@@ -360,8 +362,6 @@ class Collection():
         else:
             print(f"No files found in directory '{dir_path}'.")
 
-        
-
     async def aadd(self, path: List[str] | str | Path):
         # Prepare the Docs object by adding a bunch of documents
         if isinstance(path, str) or isinstance(path, Path):
@@ -378,6 +378,9 @@ class Collection():
             else:
                 doc_path = doc_obj
 
+            print(f"doc_path.is_dir(): {doc_path.is_dir()}")
+            print(f"doc_path.is_file(): {doc_path.is_file()}")
+
             if doc_path.is_dir():
                 all_files.extend([p for p in doc_path.rglob('*') if p.is_file() and self.is_solvable_file(p)])
             elif doc_path.is_file():
@@ -393,13 +396,11 @@ class Collection():
 
         semaphore = asyncio.Semaphore(4)  # Limit to 4 concurrent tasks
 
-        tasks = [self._process_single_doc(doc_path, semaphore) for doc_path in doc_paths]
+        tasks = [self._process_single_doc(file_path, semaphore) for file_path in all_files]
         await tqdm_asyncio.gather(*tasks)
         
         self.update_dockey_file()
         
-
-
     async def ainvoke(self, input: str, **kwargs):
         ''' Query the Docs object to get an answer '''
         docs = await self.retriever.ainvoke(input)
@@ -417,6 +418,8 @@ class Collection():
 
         scored_docs.sort(key=lambda x: x.metadata["relevance_score"], reverse=True)
 
+        await simulate_streaming("\n\n", callback=self.callback) ## for testing streaming
+
         print(f"Score Threshold: {self.score_threshold}, Scores: {scores}")
 
         citations = []
@@ -427,7 +430,7 @@ class Collection():
             if page_num != 'Unknown':
                 page_num = int(page_num)+1
             context.append(f"{i} [Source: {doc.metadata.get('source','Unknown')} Page:{page_num} Relevance Score:{doc.metadata.get('relevance_score','Unknown')}]:\n {doc.page_content}]")
-            citations.append(f"[{i}] {doc.metadata.get('source','Unknown')}, page {page_num}")
+            citations.append(f"[{i}] {doc.metadata.get('source','Unknown')}, page {page_num}, '{doc.page_content[:30]}...'")
         
         default_answer_format = AnswerFormat()
 
@@ -441,11 +444,18 @@ class Collection():
 
         print(question)
 
-        main_content = await stream_response(self.llm, inputs=question, streaming=self.streaming)
+        # main_content = await stream_response(self.llm, inputs=question, streaming=False, callback=self.callback)
+
+        main_content = await self.llm.ainvoke(question)
+        main_content = get_content_from_response(main_content)
+
+        # main_content = await stream_response(self.llm, inputs=question, streaming=self.streaming, callback=self.callback)
+
+
         # main_answer = await self.llm.ainvoke(question)
         # main_content = get_content_from_response(main_answer)
 
-        res = re.findall(r'[⁽\[]([⁰¹²³⁴⁵⁶⁷⁸⁹,\s\d]+)[⁾\]]', main_content)
+        res = re.findall(r'[⁽\[\()]([⁰¹²³⁴⁵⁶⁷⁸⁹,\s\d]+)[⁾\]\)]', main_content)
         # print(res)
         cite_ids = []
         for group in res:
@@ -466,8 +476,8 @@ class Collection():
         reference_str = "\n\nReference:\n"  + citation_str
 
         res = main_content + reference_str
-        # print(res)
-        print(reference_str)
+        await simulate_streaming(text=reference_str, callback=self.callback)
+        
 
 
         return res
@@ -487,6 +497,8 @@ class ResearchBotConfig(BaseModel):
     is_local_embedding: bool = Field(True, description="Whether to use local embedding model.")
     is_local_cross_encoder: bool = Field(True, description="Whether to use local cross encoder.")
     llm_model: str = Field("deepseek/deepseek-chat", description="LLM model path or API.")
+    llm_api_key: Optional[str] = Field(None, description="API key for the LLM if required.")
+    llm_api_base: Optional[str] = Field(None, description="Base URL for the LLM API if required.")
     embedding_model: str = Field("BAAI/bge-m3", description="Embedding model path or API.")
     cross_encoder_model: str = Field("BAAI/bge-reranker-base", description="Cross-encoder's path or API.")
     # cross_encoder_model: str = Field("cross-encoder/ms-marco-MiniLM-L-6-v2", description="Cross-encoder's path or API.")
@@ -521,15 +533,15 @@ class EmailAgent():
             if from_addr is None:
                 from_addr = self.default_email_addr
 
-            print(f"Sending email from {from_addr} to {to_addr} with subject '{subject}'...")
-            print(f"Email content:\n{text}\n")
-            # ## Send Email
-            # self.client.inboxes.messages.send(
-            #     inbox_id=from_addr,
-            #     to=to_addr,
-            #     subject=subject,
-            #     text=text
-            # )
+            await simulate_streaming(f"Sending email from {from_addr} to {to_addr} with subject '{subject}'...")
+            await simulate_streaming(f"Email content:\n{text}\n")
+            ## Send Email
+            self.client.inboxes.messages.send(
+                inbox_id=from_addr,
+                to=to_addr,
+                subject=subject,
+                text=text
+            )
             return "Email Done"
         
 
@@ -543,8 +555,6 @@ class EmailAgent():
             # Initialize the client
             self.client = AgentMail(api_key=api_key)
 
-            
-            
             if not email_addr:
                 raise ValueError("Email address must be provided in the config.")
             
@@ -570,7 +580,7 @@ class EmailAgent():
             print(self.inbox)
             self.is_available=True
         except Exception as e:
-            print("Email agent is not available!")
+            print("Email agent is not available! Error: ", e)
             self.is_available=False
 
     async def __call__(self, state: State):
@@ -579,7 +589,6 @@ class EmailAgent():
         print(type(state))
         result = await self.agent.ainvoke(state)
         print(result)
-        # state.messages.append(result)
         
         return result#{"messages": [result]}
     
@@ -603,7 +612,11 @@ class ResearchBot():
         @tool(return_direct=True)
         async def local_files_search(query):
             '''
-                Searches information in the local files or personal folders based on the user's query.
+                Searches information from the following sources:
+                    1. local files
+                    2. personal folders
+                    3. knowledge base
+                    4. personal knowledge base
             '''
             print(query)
             res = await self.collection.ainvoke(query)
@@ -631,24 +644,6 @@ class ResearchBot():
                 keywords, must_have_all_keywords, categories, must_have_all_categories,
                 authors, must_have_all_authors, date_from, date_to, max_results, sort_by, markdown_format
             )
-        
-        def should_use_tools(state: State) -> Command[Literal["research_tools_node","__end__"]]:
-            messages = state.messages
-            last_message = messages[-1]
-
-            print("---------------- Node: should_use_tools ----------------")
-
-            goto = "__end__"
-
-            if last_message.tool_calls:
-                goto = "research_tools_node"
-            else:
-                print("No tool calls detected, ending the process.")
-                goto = "__end__"
-
-            print("---------------- Node: should_use_tools ----------------")
-
-            return Command(goto=goto)
 
         self.config = config
         streaming = config.streaming
@@ -660,42 +655,61 @@ class ResearchBot():
             local_model_path = f"./models/{config.embedding_model}" 
 
             if not Path(local_model_path).exists():
+                print("Downloading embedding model to local path...")
                 snapshot_download(
                     repo_id=config.embedding_model,
                     local_dir=local_model_path,
                     local_dir_use_symlinks=False
                 )
+            else:
+                print("Using embedding model from local path:{}".format(config.embedding_model))
             embedding = local_model_path
         else:
+            
             embedding = config.embedding_model
 
         if is_local_cross_encoder:
             local_cross_encoder_path = f"./models/{config.cross_encoder_model}"
             if not Path(local_cross_encoder_path).exists():
+                print("Downloading cross encoder model to local path...")
                 snapshot_download(
                     repo_id=config.cross_encoder_model,
                     local_dir=local_cross_encoder_path,
                     local_dir_use_symlinks=False
                 )
+            else:
+                print("Using cross encoder model from local path:{}".format(config.cross_encoder_model))
             cross_encoder = local_cross_encoder_path
         else:
             cross_encoder = config.cross_encoder_model
         
+        if config.llm_api_key is not None:
+            config.llm_api_key = config.llm_api_key.strip()
 
-        
+            os.environ['OPENAI_API_KEY'] = config.llm_api_key
+            os.environ['DEEPSEEK_API_KEY'] = config.llm_api_key
+            os.environ['BAAI_API_KEY'] = config.llm_api_key
+            os.environ['ANTHROPIC_API_KEY'] = config.llm_api_key
+            os.environ['GEMINI_API_KEY'] = config.llm_api_key
+            os.environ['QWEN_API_KEY'] = config.llm_api_key
 
-        # Initialize with your desired model and enable streaming
-        self.main_llm = ChatLiteLLM(
-            model=config.llm_model, # Or any LiteLLM-supported model
-            streaming=streaming,
-            temperature=0
-        )
+        print(config)
+        try:
+            ## Initialize with your desired model and enable streaming
+            self.main_llm = ChatLiteLLM(
+                model=config.llm_model, # Or any LiteLLM-supported model
+                streaming=streaming,
+                temperature=0
+            )
 
-        self.assistant_llm= ChatLiteLLM(
-            model=config.llm_model, # Or any LiteLLM-supported model
-            streaming=False,
-            temperature=0
-        )
+            self.assistant_llm= ChatLiteLLM(
+                model=config.llm_model, # Or any LiteLLM-supported model
+                streaming=False,
+                temperature=0
+            )
+        except Exception as e:
+            print(f"Error initializing LLM: {e}")
+            raise e
 
         ## TODO: make sure that the llm supports streaming and tool calls
 
@@ -715,20 +729,20 @@ class ResearchBot():
             content=config.system_prompt
         )
 
+        # print("@Here! System prompt: ", system_prompt.content)
+
 
         self.arxiv_client = arxiv.Client(delay_seconds=4)
 
         ## by default this function actually create a ReAct agent graph
         self.research_agent = create_agent(
             self.main_llm,
-            tools = research_tools,
+            tools=research_tools,
             system_prompt=system_prompt
         )
 
         self.email_agent = EmailAgent(email_addr=config.email_addr, llm_model=self.main_llm)
         self.is_email_agent_availble = self.email_agent.is_available
-
-        # research_tools_node = ToolNode(tools)
 
 
         builder = StateGraph(State)
@@ -736,6 +750,13 @@ class ResearchBot():
         def router_node(state: State) -> State:
             print("Starting to route...")
             return state
+        
+        # async def do_research_event(state: State):
+        #     print("Starting to do research...")
+        #     input_text = state.messages[-1].content
+        #     await simulate_streaming("\n")
+        #     res = await self.research_agent.ainvoke({"messages": content_expand_system_prompt.format(content=input_text)})
+        #     return {"messages": [AIMessage(content=res)]}
         
         async def send_email_event(state: State):
             print("Starting to send email...")
@@ -771,15 +792,7 @@ class ResearchBot():
             ## First: to classify with rule-based patterns
             input_text_lower = input_text.strip().lower()
 
-            strong_email_signals = [
-                r"^send .*email", 
-                r"^compose .*mail", 
-                r"send .* via email"
-            ]
-            for pattern in strong_email_signals:
-                if re.search(pattern, input_text_lower):
-                    print(f"Router (Rule-based): Hit pattern '{pattern}' -> send_email_event")
-                    return "send_email_event"
+            
             
 
             ## Second: to classify with cross-encoder
@@ -788,49 +801,63 @@ class ResearchBot():
             if self.is_email_agent_availble:
                 intent.append("send an email to someone")
 
+                strong_email_signals = [
+                    r"^send .*email", 
+                    r"^compose .*mail", 
+                    r"send .* via email"
+                ]
+                for pattern in strong_email_signals:
+                    if re.search(pattern, input_text_lower):
+                        print(f"Router (Rule-based): Hit pattern '{pattern}' -> send_email_event")
+                        return "send_email_event"
+
             scores = self.cross_encoder.predict([[input_text_lower, query] for query in  intent])
             best_intent_idx = int(np.argmax(scores))
             print(f"Router (Cross-Encoder): intent scores: {scores}, best intent idx: {intent[best_intent_idx]}")
 
-            send_email_event_indices = [3]
-            research_agent_indices = [0,1]
+
+            research_agent_indices = [i for i in range(len(intent))]
+            send_email_event_indices = [len(intent)-1] if self.is_email_agent_availble else []
+            
             if best_intent_idx in send_email_event_indices:
                 return "send_email_event"
             elif best_intent_idx in research_agent_indices:
                 return "do_research_event"
-            
-
-            
-            ## Third: to classify with structured output parsing with llm
-            try:
-                choice = create_schema_by_tool_binding(self.main_llm, RouterChoice, input_text_lower)
-                goto = choice.classification
-                print(f"Router (Schema): reasoning: {choice.reasoning}, goto: {choice.classification}")
-
-                # second way to output structured data
-                # router_prompt = (
-                #     '''You are the routing decision maker.
-                #         Current members: do_research_event, send_email_event
-                #         Based on the current context, decide the next step:
-
-                #         Needs understanding requirements, planning, writing content → do_research_event
-                #         Needs to write email, format email, send email → send_email_event
-                        
-                #         Return ONLY valid JSON like: {"reasoning":"...","classification":"do_research_event"}.
-                #         classification must be exactly one of: "do_research_event" or "send_email_event".
-                #     '''
-                # )
-                # resp = create_schema_output(self.main_llm, Router, input_text+router_prompt)
-                # goto = json.loads(resp).get("classification")
-
-                if goto not in ["do_research_event", "send_email_event"]:
-                    print(f"Router error: invalid goto '{goto}'")
-                    return "do_research_event"
-                else:
-                    return goto
-            except Exception as e:
-                print(f"Router error: {e}")
+            else:
                 return "do_research_event"
+            
+
+            
+            # ## Third: to classify with structured output parsing with llm
+            # try:
+            #     choice = create_schema_by_tool_binding(self.main_llm, RouterChoice, input_text_lower)
+            #     goto = choice.classification
+            #     print(f"Router (Schema): reasoning: {choice.reasoning}, goto: {choice.classification}")
+
+            #     # second way to output structured data
+            #     # router_prompt = (
+            #     #     '''You are the routing decision maker.
+            #     #         Current members: do_research_event, send_email_event
+            #     #         Based on the current context, decide the next step:
+
+            #     #         Needs understanding requirements, planning, writing content → do_research_event
+            #     #         Needs to write email, format email, send email → send_email_event
+                        
+            #     #         Return ONLY valid JSON like: {"reasoning":"...","classification":"do_research_event"}.
+            #     #         classification must be exactly one of: "do_research_event" or "send_email_event".
+            #     #     '''
+            #     # )
+            #     # resp = create_schema_output(self.main_llm, Router, input_text+router_prompt)
+            #     # goto = json.loads(resp).get("classification")
+
+            #     if goto not in ["do_research_event", "send_email_event"]:
+            #         print(f"Router error: invalid goto '{goto}'")
+            #         return "do_research_event"
+            #     else:
+            #         return goto
+            # except Exception as e:
+            #     print(f"Router error: {e}")
+            #     return "do_research_event"
 
 
         builder.add_node("router_node", router_node)
@@ -856,16 +883,67 @@ class ResearchBot():
         ''' Create a new collection '''
         await self.collection.aadd(local_file)
 
-    async def stream_response(self, input, **kwargs):
-        ''' Stream response from the ResearchBot agent '''
-        # initital = State(messages=input)
-        # result = await self.graph.ainvoke(initital)
-        # print(get_content_from_response(result))
 
+    async def stream_response(self, input, callback=None, **kwargs):
+        ''' Stream response from the ResearchBot agent '''
+        # 使用 astream_events 来精细控制输出
         
 
-        await stream_response(self.graph, input, streaming=self.config.streaming, **kwargs)
-        # await stream_response(self.research_agent, {"messages": input}, streaming=self.config.streaming, **kwargs)
+        if isinstance(input, str):
+            inputs = {"messages": [HumanMessage(content=input)]}
+        else:
+            inputs = input
+
+        last_kind = None # 用于跟踪上一个事件类型
+
+        async for event in self.graph.astream_events(inputs, version="v1"):
+            kind = event["event"]
+            
+            # 只关心 chat_model 生成的块流 (on_chat_model_stream)
+            if kind == "on_chat_model_stream":
+                # [新增] 如果是从其他事件切换回来的（比如刚执行完工具），先加个换行美化一下
+                if last_kind and last_kind != "on_chat_model_stream":
+                     if callback: callback("\n")
+                     print("\n", end="", flush=True)
+
+                content = event["data"]["chunk"].content
+                # 确保 content 不为空
+                if content: 
+                    if callback:
+                        callback(content)
+                    print(content, end="", flush=True)
+                
+                last_kind = kind # 更新状态
+
+            # [新增] 监听工具结束事件，给工具输出前后加换行
+            elif kind == "on_tool_end":
+                if callback: callback("\n")
+                print("\n", end="", flush=True)
+                last_kind = kind
+
+    # async def stream_response(self, input, callback=None, **kwargs):
+    #     ''' Stream response from the ResearchBot agent '''
+    #     # 使用 astream_events 来精细控制输出
+
+    #     if isinstance(input, str):
+    #         inputs = {"messages": [HumanMessage(content=input)]}
+    #     else:
+    #         inputs = input
+
+    #     async for event in self.graph.astream_events(inputs, version="v1"):
+    #         kind = event["event"]
+            
+    #         # 只关心 chat_model 生成的块流 (on_chat_model_stream)
+    #         if kind == "on_chat_model_stream":
+    #             content = event["data"]["chunk"].content
+    #             # 确保 content 不为空，且不是工具调用请求
+    #             if content: 
+    #                 if callback:
+    #                     callback(content)
+    #                 print(content, end="", flush=True)
+
+        ## simple stream
+        # await stream_response(self.graph, input, streaming=self.config.streaming, **kwargs)
 
     async def ainvoke(self, input: str| list[HumanMessage]| State, **kwargs):
         ''' Asynchronously query the ResearchBot agent to get an answer '''
@@ -887,6 +965,10 @@ class ResearchBot():
         else:
             return self.graph.invoke(State(messages=[HumanMessage(content=input)]), **kwargs)
         
+    def set_callback(self, callback):
+        ''' Set the callback function for streaming responses '''
+        self.collection.set_callback(callback)
+        self.callback = callback
 
     async def _process_single_arxiv(self, llm, title: str, full_summary: str, semaphore: asyncio.Semaphore) -> ArxivRefine|None:
         ''' Process a single document and add it to the vector store '''
@@ -1031,9 +1113,15 @@ class ResearchBot():
         
         arxiv_papers = list(arxiv_results.papers)
         
-        ## check if no papers found
-        if not arxiv_papers:
+        
+
+        if len(arxiv_papers) == 0:
+            await simulate_streaming(text=f"\nNo papers found for query: {query}\n\n", callback=self.callback)
             return f"No papers found for query: {query}\n\n"
+        else:
+            await simulate_streaming(text=f"Found {len(arxiv_papers)} papers for query: {query}\n\n", callback=self.callback)
+
+        
         
         # ## create refine chain
         # refine_chain = ChatPromptTemplate.from_template(abstract_refine_system_prompt) | self.assistant_llm
@@ -1047,47 +1135,61 @@ class ResearchBot():
         ## TODO: add semaphore to limit the number of concurrent tasks to avoid OOM or rate limits.
         ## TODO: summarize abstract and extract keywords.
         ## create a chain to refine abstract and extract keywords
-        semaphore = asyncio.Semaphore(8)  # Limit to 4 concurrent tasks
+        batch_size = 4
+        semaphore = asyncio.Semaphore(batch_size)  # Limit to 4 concurrent tasks
 
-        tasks = [self._process_single_arxiv(self.assistant_llm, paper.title, paper.full_summary, semaphore) for paper in arxiv_papers]
-        refined_info = await tqdm_asyncio.gather(*tasks)
+        for i in range(0, len(arxiv_papers), batch_size):
+            batch_papers = arxiv_papers[i:i+batch_size]
 
+            tasks = [self._process_single_arxiv(self.assistant_llm, paper.title, paper.full_summary, semaphore) for paper in batch_papers]
+            refined_info = await tqdm_asyncio.gather(*tasks)
 
+            await simulate_streaming(text="\n", callback=self.callback)
 
-        ## Process papers (invoking LLM for summary extraction)
-        for i, (paper, refined) in enumerate(zip(arxiv_papers, refined_info)):
-            keywords_str = ", ".join(refined.keywords) if refined and refined.keywords else "N/A"
-            refined_summary_str = refined.refined_summary if refined and refined.refined_summary else "N/A"
-            if markdown_format:
-                entry = (
-                    f"### {i+1}. {paper.title}\n"
-                    f"{', '.join(paper.authors)}\n"
-                    f"- **Refined Summary (AI)**: {refined_summary_str}\n"
-                    f"- **Keywords (AI): {keywords_str}\n"
-                    f"- **Link**: {paper.pdf_url}\n"
-                    f"- **Published**: {paper.published}  **Updated**: {paper.updated}\n"
-                )
-            else:
-                if i==0:
-                    s = f"====================================\n\n"
+            ## Process papers (invoking LLM for summary extraction)
+            for j, (paper, refined) in enumerate(zip(batch_papers, refined_info)):
+                keywords_str = ", ".join(refined.keywords) if refined and refined.keywords else "N/A"
+                refined_summary_str = refined.refined_summary if refined and refined.refined_summary else "N/A"
+                paper_idx = i+j+1
+
+                print(f"------------- Paper {paper_idx} ---------------")
+
+                
+                if markdown_format:
+                    entry = (
+                        f"### {paper_idx}. {paper.title}\n"
+                        f"{', '.join(paper.authors)}\n"
+                        f"- **Refined Summary (AI)**: {refined_summary_str}\n"
+                        f"- **Keywords (AI): {keywords_str}\n"
+                        f"- **Link**: {paper.pdf_url}\n"
+                        f"- **Published**: {paper.published}  **Updated**: {paper.updated}\n"
+                    )
                 else:
-                    s = ""
-                s += (
-                    f"Keywords (AI): \n{keywords_str}\n\n"
-                    f"{i+1}. {paper.title}\n\n"
-                    f"Authors: \n{', '.join(paper.authors)}\n\n"
-                    f"Refined Summary (AI): \n{refined_summary_str}\n\n"
-                    f"Link: {paper.pdf_url}\n\n"
-                    f"Published: {paper.published}\n"
-                    f"Updated: {paper.updated}\n"
+                    if i==0:
+                        s = f"\n"
+                    else:
+                        s = ""
+                    s += (
+                        f"Keywords (AI): \n{keywords_str}\n\n"
+                        f"{paper_idx}. {paper.title}\n\n"
+                        f"Authors: \n{', '.join(paper.authors)}\n\n"
+                        f"Refined Summary (AI): \n{refined_summary_str}\n\n"
+                        f"Link: {paper.pdf_url}\n\n"
+                        f"Published: {paper.published}\n"
+                        f"Updated: {paper.updated}\n"
+                        
+                        f"------------------------------------\n"
+                    )
                     
-                    f"------------------------------------\n"
-                )
+                    entry = s
+                    
+                # print(entry)
+                await simulate_streaming(text=entry, callback=self.callback)
+                print(self.config.streaming, self.callback)
                 
-                entry = s
-                
-            print(entry)
-            formatted_output.append(entry)
+                formatted_output.append(entry)
+
+        # await simulate_streaming(text="\n\n", callback=self.callback)
 
         print("------------- arxiv_search ---------------")
 

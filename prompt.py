@@ -50,9 +50,14 @@ Content: \n\n
 '''
 
 research_agent_prompt = '''
-You are a research assistant. 
-When displaying search results, DO NOT summarize or rewrite specific paper entries. 
-Display the papers exactly as returned by the tool, preserving the markdostructure.
+You are a helpful assistant. Process the user's request using available tools when appropriate.
+
+Guidelines:
+- Do not repeat the user's request in your response.
+- If tools are available and relevant, use them to complete the task.
+- If no tools are needed, return the content unchanged without adding extra information.
+- When displaying results, DO NOT summarize or rewrite specific entries.
+- Do not use markdown formatting when displaying results.
 '''
 
 # IMPORTANT RULES when searching arxiv papers:
